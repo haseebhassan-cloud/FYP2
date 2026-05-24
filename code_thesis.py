@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import matplotlib.pyplot as plt
+from hrc_mujoco_env import MuJoCoHRCEnv
+import os
 
 # --- Environment Definition ---
 
@@ -72,28 +74,42 @@ class HRCEnvironment(gym.Env):
         net_flow = self.robot_speed - self.human_speed
         self.buffer = np.clip(self.buffer + net_flow, 0, 10)
 
-        # 4. Reward Function
-        throughput = self.human_speed
-        idle_penalty = 1.0 if self.robot_speed < 0.2 else 0.0
-        overflow_penalty = 2.0 if self.buffer >= 9.5 or self.buffer <= 0.5 else 0.0
-        smoothness_penalty = abs(self.robot_speed - self.human_speed) * 0.5
+        # 4. Metrics & Reward
+        elbow_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_JOINT, "elbow_joint")
+        human_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_JOINT, "human_x")
 
-        reward = throughput - \
-            (idle_penalty + overflow_penalty + smoothness_penalty)
+        # Take the ABSOLUTE speed because direction doesn't matter for throughput
+        actual_robot_v = abs(self.data.qvel[elbow_id])
+        actual_human_v = abs(self.data.qvel[human_id])
 
-        # 5. Check Termination
-        terminated = self.steps >= self.max_steps
-        truncated = False
+        # Update buffer based on relative speeds
+        self.buffer = np.clip(
+            self.buffer + (self.data.qvel[elbow_id] - self.data.qvel[human_id]), 0, 10)
 
-        state = np.array([self.buffer, self.robot_speed,
-                         self.human_speed], dtype=np.float32)
+        # --- THE REWARD RESTRUCTURE ---
+        # Base reward is throughput (progress)
+        throughput = actual_human_v
 
-        info = {"throughput": throughput,
-                "idle": idle_penalty, "buffer": self.buffer}
-        return state, reward, terminated, truncated, info
+        # Synchronization penalty
+        sync_penalty = abs(actual_robot_v - actual_human_v) * 0.5
 
-    def set_learning_decay(self, episode, total_episodes):
-        self.learning_decay = max(0.1, 1.0 - (episode / total_episodes))
+        # CRITICAL: Laziness Penalty (If the arm isn't moving, penalize it!)
+        lazy_penalty = 2.0 if actual_robot_v < 0.05 else 0.0
+
+        # Combine them
+        reward = throughput - sync_penalty - lazy_penalty
+
+        # Buffer Boundary Penalty
+        if self.buffer >= 9.5 or self.buffer <= 0.5:
+            reward -= 5.0
+
+        info = {
+            "throughput": throughput,
+            "idle": 1.0 if actual_robot_v < 0.05 else 0.0,
+            "buffer": self.buffer
+        }
 
 # --- DQN Controller ---
 
@@ -129,8 +145,20 @@ class DQNAgent:
         self.batch_size = 64
         self.gamma = 0.99
         self.epsilon = 1.0
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.9995
         self.epsilon_min = 0.01
+
+    def save(self, filepath):
+        """Saves the PyTorch model state dictionary"""
+        torch.save(self.model.state_dict(), filepath)
+        print(f" Successfully saved model weights to {filepath}")
+
+    def load(self, filepath):
+        """Loads the PyTorch model state dictionary"""
+        self.model.load_state_dict(torch.load(
+            filepath, map_location=self.device))
+        self.model.eval()  # Set to evaluation mode
+        print(f" Successfully loaded model weights from {filepath}")
 
     def act(self, state):
         if np.random.rand() <= self.epsilon:
@@ -177,9 +205,9 @@ class DQNAgent:
 # --- Training Loop ---
 
 
-def run_experiment(is_stochastic=True, episodes=150):
-    env = HRCEnvironment(is_stochastic=is_stochastic)
-    agent = DQNAgent(state_dim=3, action_dim=3)
+def run_experiment(is_stochastic, episodes=100):
+    env = MuJoCoHRCEnv(is_stochastic=is_stochastic)
+    agent = DQNAgent(env.observation_space.shape[0], env.action_space.n)
 
     history = {"reward": [], "throughput": [], "idle": []}
 
@@ -216,39 +244,79 @@ def run_experiment(is_stochastic=True, episodes=150):
         history["throughput"].append(ep_throughput / 100)
         history["idle"].append(ep_idle)
 
-    return history
+    return history, agent
 
 
-# --- Execution ---
-print("Training Deterministic Baseline...")
-baseline_history = run_experiment(is_stochastic=False, episodes=100)
+# --- Standalone Helper Functions (Safe to leave out in the open for imports) ---
 
-print("\nTraining Stochastic HRC Model...")
-stochastic_history = run_experiment(is_stochastic=True, episodes=100)
+def moving_average(data, window_size=10):
+    if len(data) < window_size:
+        return data
+    # We use 'valid' to ensure the average is only calculated on full windows
+    return np.convolve(data, np.ones(window_size), 'valid') / window_size
 
-# Visualization
-fig, axs = plt.subplots(1, 3, figsize=(18, 5))
 
-axs[0].plot(baseline_history["reward"], label="Deterministic", alpha=0.7)
-axs[0].plot(stochastic_history["reward"],
-            label="Stochastic (Adaptive)", color='orange')
-axs[0].set_title("Reward Curve")
-axs[0].set_xlabel("Episode")
-axs[0].legend()
+def plot_with_smooth(ax, data_baseline, data_stochastic, title, ylabel, window=10, color_base='tab:blue', color_stoch='orange'):
+    # Calculate moving averages
+    smooth_base = moving_average(data_baseline, window)
+    smooth_stoch = moving_average(data_stochastic, window)
 
-axs[1].plot(baseline_history["throughput"], label="Deterministic", alpha=0.7)
-axs[1].plot(stochastic_history["throughput"],
-            label="Stochastic (Adaptive)", color='green')
-axs[1].set_title("Avg Throughput per Step")
-axs[1].set_xlabel("Episode")
-axs[1].legend()
+    # X-axis for smooth data (starts at window - 1)
+    x_smooth = range(window - 1, len(data_baseline))
 
-axs[2].plot(baseline_history["idle"], label="Deterministic", alpha=0.7)
-axs[2].plot(stochastic_history["idle"],
-            label="Stochastic (Adaptive)", color='red')
-axs[2].set_title("Total Robot Idle Steps")
-axs[2].set_xlabel("Episode")
-axs[2].legend()
+    # Plot Raw Data (Faded background)
+    ax.plot(data_baseline, color=color_base,
+            alpha=0.2, label="Raw Deterministic")
+    ax.plot(data_stochastic, color=color_stoch,
+            alpha=0.2, label="Raw Stochastic")
 
-plt.tight_layout()
-plt.show()
+    # Plot Smoothed Data (Bold foreground)
+    ax.plot(x_smooth, smooth_base, color=color_base, linewidth=2,
+            label=f"Smooth Deterministic (N={window})")
+    ax.plot(x_smooth, smooth_stoch, color=color_stoch,
+            linewidth=2, label=f"Smooth Stochastic (N={window})")
+
+    ax.set_title(title)
+    ax.set_xlabel("Episode")
+    ax.set_ylabel(ylabel)
+    ax.legend(fontsize='small')
+
+
+# --- MAIN EXECUTION GUARD (Everything inside here runs ONLY when executing test_env.py directly) ---
+
+if __name__ == "__main__":
+    print("Training Deterministic Baseline...")
+    baseline_history, baseline_agent = run_experiment(
+        is_stochastic=False, episodes=100)
+
+    print("\nTraining Stochastic HRC Model...")
+    stochastic_history, stochastic_agent = run_experiment(
+        is_stochastic=True, episodes=100)
+
+    # --- SAVE THE TRAINED BRAINS ---
+    # Dynamically find the folder where test_env.py is currently living
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    save_path = os.path.join(current_dir, "ur5_hrc_dqn.pt")
+
+    # Save using the absolute, dynamic path
+    stochastic_agent.save(save_path)
+    print(f"\nSuccessfully saved weights to: {save_path}!")
+
+    # --- INDENTED VISUALIZATION CODE ---
+    window = 10
+    fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+
+    # 1. Reward Curve
+    plot_with_smooth(axs[0], baseline_history["reward"], stochastic_history["reward"],
+                     "Reward Curve", "Total Reward", window=window, color_base='tab:blue', color_stoch='orange')
+
+    # 2. Avg Throughput per Step
+    plot_with_smooth(axs[1], baseline_history["throughput"], stochastic_history["throughput"],
+                     "Avg Throughput per Step", "Velocity (m/s)", window=window, color_base='tab:blue', color_stoch='green')
+
+    # 3. Total Robot Idle Steps
+    plot_with_smooth(axs[2], baseline_history["idle"], stochastic_history["idle"],
+                     "Total Robot Idle Steps", "Count", window=window, color_base='tab:blue', color_stoch='red')
+
+    plt.tight_layout()
+    plt.show()
