@@ -134,5 +134,11 @@ class MuJoCoHRCEnv(gym.Env):
             "buffer": self.buffer
         }
 
-        # Return your observation tuple (adjust matching your environment definition)
-        return self._get_obs(), reward, self.steps >= self.max_steps, False, info
+        # --- GYMNASIUM TERMINATION STANDARDS (BUG 3 FIXED) ---
+        # Terminated = True if the agent fails catastrophically (buffer hits absolute limits)
+        terminated = bool(self.buffer >= 10.0 or self.buffer <= 0.0)
+
+        # Truncated = True if we just hit the episode time limit
+        truncated = bool(self.steps >= self.max_steps)
+
+        return self._get_obs(), reward, terminated, truncated, info
