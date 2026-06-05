@@ -10,107 +10,6 @@ import matplotlib.pyplot as plt
 from hrc_mujoco_env import MuJoCoHRCEnv
 import os
 
-# --- Environment Definition ---
-
-
-class HRCEnvironment(gym.Env):
-    def __init__(self, is_stochastic=True, max_steps=100):
-        super(HRCEnvironment, self).__init__()
-
-        # State: [Buffer Occupancy (0-10), Robot Speed (0-2), Est. Human Speed (0-2)]
-        self.observation_space = spaces.Box(
-            low=0, high=10, shape=(3,), dtype=np.float32)
-
-        # Actions: 0: Increase, 1: Decrease, 2: Maintain (Robot Speed)
-        self.action_space = spaces.Discrete(3)
-
-        self.max_steps = max_steps
-        self.is_stochastic = is_stochastic
-
-        self.initial_human_speed = 1.0
-        self.fatigue_rate = 0.01 if is_stochastic else 0.0
-        self.noise_std = 0.1 if is_stochastic else 0.0
-        self.learning_decay = 1.0
-
-        self.reset()
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self.buffer = 5.0
-        self.robot_speed = 1.0
-        self.human_speed = self.initial_human_speed
-        self.fatigue = 0.0
-        self.steps = 0
-
-        state = np.array([self.buffer, self.robot_speed,
-                         self.human_speed], dtype=np.float32)
-        return state, {}
-
-    def step(self, action):
-        self.steps += 1
-
-        # 1. Update Robot Speed
-        if action == 0:
-            self.robot_speed = min(2.0, self.robot_speed + 0.1)
-        elif action == 1:
-            self.robot_speed = max(0.1, self.robot_speed - 0.1)
-
-        # 2. Human Stochasticity Logic
-        current_noise_std = self.noise_std * self.learning_decay
-        current_fatigue_rate = self.fatigue_rate * self.learning_decay
-
-        concentration_multiplier = 1.0
-        if self.is_stochastic and random.random() < 0.05:
-            concentration_multiplier = 0.5
-
-        noise = np.random.normal(0, current_noise_std)
-        self.human_speed = (self.initial_human_speed -
-                            self.fatigue) * concentration_multiplier + noise
-        self.human_speed = max(0.2, self.human_speed)
-
-        self.fatigue += current_fatigue_rate
-
-        # 3. Buffer Dynamics
-        net_flow = self.robot_speed - self.human_speed
-        self.buffer = np.clip(self.buffer + net_flow, 0, 10)
-
-        # 4. Metrics & Reward
-        elbow_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_JOINT, "elbow_joint")
-        human_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_JOINT, "human_x")
-
-        # Take the ABSOLUTE speed because direction doesn't matter for throughput
-        actual_robot_v = abs(self.data.qvel[elbow_id])
-        actual_human_v = abs(self.data.qvel[human_id])
-
-        # Update buffer based on relative speeds
-        self.buffer = np.clip(
-            self.buffer + (self.data.qvel[elbow_id] - self.data.qvel[human_id]), 0, 10)
-
-        # --- THE REWARD RESTRUCTURE ---
-        # Base reward is throughput (progress)
-        throughput = actual_human_v
-
-        # Synchronization penalty
-        sync_penalty = abs(actual_robot_v - actual_human_v) * 0.5
-
-        # CRITICAL: Laziness Penalty (If the arm isn't moving, penalize it!)
-        lazy_penalty = 2.0 if actual_robot_v < 0.05 else 0.0
-
-        # Combine them
-        reward = throughput - sync_penalty - lazy_penalty
-
-        # Buffer Boundary Penalty
-        if self.buffer >= 9.5 or self.buffer <= 0.5:
-            reward -= 5.0
-
-        info = {
-            "throughput": throughput,
-            "idle": 1.0 if actual_robot_v < 0.05 else 0.0,
-            "buffer": self.buffer
-        }
-
 # --- DQN Controller ---
 
 
@@ -246,8 +145,8 @@ def run_experiment(is_stochastic, episodes=100):
 
     return history, agent
 
-
 # --- Standalone Helper Functions (Safe to leave out in the open for imports) ---
+
 
 def moving_average(data, window_size=10):
     if len(data) < window_size:
@@ -281,8 +180,8 @@ def plot_with_smooth(ax, data_baseline, data_stochastic, title, ylabel, window=1
     ax.set_ylabel(ylabel)
     ax.legend(fontsize='small')
 
+# --- MAIN EXECUTION GUARD (Everything inside here runs ONLY when executing code_thesis.py directly) ---
 
-# --- MAIN EXECUTION GUARD (Everything inside here runs ONLY when executing test_env.py directly) ---
 
 if __name__ == "__main__":
     print("Training Deterministic Baseline...")
@@ -294,7 +193,7 @@ if __name__ == "__main__":
         is_stochastic=True, episodes=100)
 
     # --- SAVE THE TRAINED BRAINS ---
-    # Dynamically find the folder where test_env.py is currently living
+    # Dynamically find the folder where code_thesis.py is currently living
     current_dir = os.path.dirname(os.path.abspath(__file__))
     save_path = os.path.join(current_dir, "ur5_hrc_dqn.pt")
 
